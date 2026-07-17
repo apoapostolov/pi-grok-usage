@@ -2,9 +2,9 @@
  * Grok account usage footer for Pi.
  *
  * Polls Grok Build billing (same source as Grok TUI `/usage`) and shows
- * weekly/monthly credit usage in the Pi status bar.
+ * credit usage in the Pi status bar.
  *
- * Auth: ~/.grok/auth.json OIDC key (from `grok login`)
+ * Auth: ~/.grok/auth.json OIDC key (from `grok login`), with refresh support
  * API:  GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
  *
  * Commands:
@@ -12,23 +12,22 @@
  *   /grok-usage clear  hide footer
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const STATUS_ID = "grok-usage";
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const FETCH_COOLDOWN_MS = 120_000;
+const REQUEST_TIMEOUT_MS = 10_000;
+/** Refresh a bit before expiry to avoid edge races. */
+const EXPIRY_SKEW_MS = 60_000;
 const AUTH_PATH = join(homedir(), ".grok", "auth.json");
-
-type PeriodType =
-	| "USAGE_PERIOD_TYPE_WEEKLY"
-	| "USAGE_PERIOD_TYPE_MONTHLY"
-	| string;
+const DEFAULT_ISSUER = "https://auth.x.ai";
 
 interface BillingConfig {
 	currentPeriod?: {
-		type?: PeriodType;
+		type?: string;
 		start?: string;
 		end?: string;
 	};
@@ -52,6 +51,19 @@ interface GrokAuthEntry {
 	expires_at?: string;
 	email?: string;
 	auth_mode?: string;
+	oidc_issuer?: string;
+	oidc_client_id?: string;
+}
+
+interface ResolvedAuth {
+	/** Map key inside auth.json */
+	entryId: string;
+	token: string;
+	refreshToken?: string;
+	email?: string;
+	expiresAtMs?: number;
+	issuer: string;
+	clientId?: string;
 }
 
 interface UsageSnapshot {
@@ -80,49 +92,206 @@ function resetLocalLabel(endIso?: string): string {
 	if (!endIso) return "";
 	const end = new Date(endIso);
 	if (Number.isNaN(end.getTime())) return "";
-	const weekday = end.toLocaleDateString(undefined, { weekday: "short" }); // e.g. Thu
+	const weekday = end.toLocaleDateString(undefined, { weekday: "short" });
 	const hour = end.toLocaleTimeString(undefined, {
 		hour: "2-digit",
 		minute: "2-digit",
 		hour12: false,
 	});
-	// Some locales still emit "24:xx" or include extra spaces; normalize.
 	const hhmm = hour.replace(/^24:/, "00:").trim();
 	return `${weekday} ${hhmm}`;
 }
 
-function readGrokAuth(): { token: string; email?: string; expiresAt?: string } | null {
+function formatPercent(n: number): string {
+	return (Math.round(n * 10) / 10).toFixed(1);
+}
+
+/** Never surface raw upstream bodies (may contain tokens or HTML dumps). */
+function sanitizeError(err: unknown): string {
+	if (err instanceof Error) {
+		const msg = err.message || "unknown error";
+		if (/^auth \d+/.test(msg) || msg.startsWith("HTTP ")) return msg;
+		if (msg.includes("abort") || msg.includes("Timeout") || msg.includes("timeout")) {
+			return "request timeout";
+		}
+		if (msg.includes("fetch failed") || msg.includes("network") || msg.includes("ECONN")) {
+			return "network error";
+		}
+		if (msg.includes("refresh")) return "token refresh failed — run `grok login`";
+		if (msg.includes("auth.json")) return msg;
+		return "request failed";
+	}
+	return "request failed";
+}
+
+function isAllowedXaiUrl(raw: string): boolean {
+	try {
+		const url = new URL(raw);
+		return url.protocol === "https:" && (url.hostname === "x.ai" || url.hostname.endsWith(".x.ai"));
+	} catch {
+		return false;
+	}
+}
+
+function readAuthFile(): Record<string, GrokAuthEntry> | null {
 	if (!existsSync(AUTH_PATH)) return null;
 	try {
 		const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8")) as Record<string, GrokAuthEntry>;
-		const entries = Object.values(raw).filter((e) => typeof e?.key === "string" && e.key.length > 0);
-		if (entries.length === 0) return null;
-
-		// Prefer non-expired token; otherwise most recently expiring entry.
-		const now = Date.now();
-		const scored = entries
-			.map((e) => {
-				const exp = e.expires_at ? Date.parse(e.expires_at) : Number.POSITIVE_INFINITY;
-				const expired = Number.isFinite(exp) ? exp <= now : false;
-				return { e, exp, expired };
-			})
-			.sort((a, b) => {
-				if (a.expired !== b.expired) return a.expired ? 1 : -1;
-				return b.exp - a.exp;
-			});
-
-		const best = scored[0].e;
-		return {
-			token: best.key!.trim(),
-			email: best.email,
-			expiresAt: best.expires_at,
-		};
+		if (!raw || typeof raw !== "object") return null;
+		return raw;
 	} catch {
 		return null;
 	}
 }
 
-async function fetchBilling(token: string, signal?: AbortSignal): Promise<UsageSnapshot> {
+function pickAuthEntry(file: Record<string, GrokAuthEntry>): ResolvedAuth | null {
+	const now = Date.now();
+	const scored = Object.entries(file)
+		.map(([entryId, e]) => {
+			const token = typeof e?.key === "string" ? e.key.trim() : "";
+			const exp = e?.expires_at ? Date.parse(e.expires_at) : Number.POSITIVE_INFINITY;
+			const expired = Number.isFinite(exp) ? exp <= now + EXPIRY_SKEW_MS : false;
+			const hasRefresh = typeof e?.refresh_token === "string" && e.refresh_token.length > 0;
+			return { entryId, e, token, exp, expired, hasRefresh };
+		})
+		.filter((x) => x.token.length > 0 || x.hasRefresh);
+
+	if (scored.length === 0) return null;
+
+	scored.sort((a, b) => {
+		// Prefer usable access tokens, then ones with refresh, then latest expiry.
+		if (a.expired !== b.expired) return a.expired ? 1 : -1;
+		if (a.hasRefresh !== b.hasRefresh) return a.hasRefresh ? -1 : 1;
+		return b.exp - a.exp;
+	});
+
+	const best = scored[0];
+	const issuer = (best.e.oidc_issuer || DEFAULT_ISSUER).replace(/\/$/, "");
+	return {
+		entryId: best.entryId,
+		token: best.token,
+		refreshToken: best.e.refresh_token?.trim() || undefined,
+		email: best.e.email,
+		expiresAtMs: Number.isFinite(best.exp) ? best.exp : undefined,
+		issuer,
+		clientId: best.e.oidc_client_id?.trim() || undefined,
+	};
+}
+
+function writeRefreshedTokens(
+	entryId: string,
+	update: { access: string; refresh?: string; expiresAtIso: string },
+): void {
+	const file = readAuthFile();
+	if (!file || !file[entryId]) return;
+	const next = {
+		...file,
+		[entryId]: {
+			...file[entryId],
+			key: update.access,
+			...(update.refresh ? { refresh_token: update.refresh } : {}),
+			expires_at: update.expiresAtIso,
+		},
+	};
+	// Keep permissions as restrictive as we can without chmod portability issues.
+	writeFileSync(AUTH_PATH, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8" });
+}
+
+async function discoverTokenEndpoint(issuer: string, signal: AbortSignal): Promise<string> {
+	const discoveryUrl = `${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`;
+	if (!isAllowedXaiUrl(discoveryUrl)) {
+		throw new Error("invalid oidc issuer");
+	}
+	const res = await fetch(discoveryUrl, {
+		headers: { Accept: "application/json" },
+		signal,
+	});
+	if (!res.ok) throw new Error(`token refresh failed (discovery HTTP ${res.status})`);
+	const json = (await res.json()) as { token_endpoint?: string };
+	const endpoint = String(json.token_endpoint || "");
+	if (!isAllowedXaiUrl(endpoint)) throw new Error("invalid token endpoint");
+	return endpoint;
+}
+
+async function refreshAccessToken(auth: ResolvedAuth, signal: AbortSignal): Promise<ResolvedAuth> {
+	if (!auth.refreshToken) {
+		throw new Error("auth expired — run `grok login`");
+	}
+	if (!auth.clientId) {
+		throw new Error("auth missing client id — run `grok login`");
+	}
+
+	const tokenEndpoint = await discoverTokenEndpoint(auth.issuer, signal);
+	const res = await fetch(tokenEndpoint, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/x-www-form-urlencoded",
+			Accept: "application/json",
+			"User-Agent": "pi-grok-usage/1.0",
+		},
+		body: new URLSearchParams({
+			grant_type: "refresh_token",
+			client_id: auth.clientId,
+			refresh_token: auth.refreshToken,
+		}).toString(),
+		signal,
+	});
+
+	if (!res.ok) {
+		throw new Error(`token refresh failed (HTTP ${res.status})`);
+	}
+
+	const payload = (await res.json()) as {
+		access_token?: string;
+		refresh_token?: string;
+		expires_in?: number;
+	};
+
+	const access = String(payload.access_token || "").trim();
+	if (!access) throw new Error("token refresh failed (empty access token)");
+
+	const expiresInSec = Number(payload.expires_in || 3600);
+	const expiresAtMs = Date.now() + Math.max(60, expiresInSec) * 1000;
+	const expiresAtIso = new Date(expiresAtMs).toISOString();
+	const refresh = String(payload.refresh_token || auth.refreshToken).trim();
+
+	try {
+		writeRefreshedTokens(auth.entryId, {
+			access,
+			refresh,
+			expiresAtIso,
+		});
+	} catch {
+		// Non-fatal: still use the fresh token in-memory this session.
+	}
+
+	return {
+		...auth,
+		token: access,
+		refreshToken: refresh,
+		expiresAtMs,
+	};
+}
+
+function needsRefresh(auth: ResolvedAuth): boolean {
+	if (!auth.token) return true;
+	if (auth.expiresAtMs == null) return false;
+	return auth.expiresAtMs <= Date.now() + EXPIRY_SKEW_MS;
+}
+
+async function resolveAuth(signal: AbortSignal): Promise<ResolvedAuth> {
+	const file = readAuthFile();
+	if (!file) throw new Error("no ~/.grok/auth.json — run `grok login`");
+	const auth = pickAuthEntry(file);
+	if (!auth) throw new Error("no usable Grok credentials — run `grok login`");
+
+	if (needsRefresh(auth)) {
+		return refreshAccessToken(auth, signal);
+	}
+	return auth;
+}
+
+async function fetchBilling(token: string, signal: AbortSignal): Promise<UsageSnapshot> {
 	const res = await fetch(BILLING_URL, {
 		method: "GET",
 		headers: {
@@ -135,25 +304,24 @@ async function fetchBilling(token: string, signal?: AbortSignal): Promise<UsageS
 	});
 
 	if (res.status === 401 || res.status === 403) {
-		throw new Error(`auth ${res.status} — run \`grok login\``);
+		throw new Error(`auth ${res.status}`);
 	}
 	if (!res.ok) {
-		const body = (await res.text().catch(() => "")).slice(0, 160);
-		throw new Error(`HTTP ${res.status}${body ? `: ${body}` : ""}`);
+		// Do not include response body in errors.
+		throw new Error(`HTTP ${res.status}`);
 	}
 
 	const data = (await res.json()) as BillingResponse;
 	const cfg = data.config ?? {};
 	const percent = Number(cfg.creditUsagePercent ?? 0);
 	const endIso = cfg.currentPeriod?.end ?? cfg.billingPeriodEnd;
-	const periodLabel = periodShort(cfg.currentPeriod?.type);
 	const products = (cfg.productUsage ?? [])
 		.filter((p) => p.product)
 		.map((p) => ({ product: String(p.product), usagePercent: p.usagePercent }));
 
 	return {
 		percent: Number.isFinite(percent) ? percent : 0,
-		periodLabel,
+		periodLabel: periodShort(cfg.currentPeriod?.type),
 		resetLabel: resetLocalLabel(endIso),
 		endIso,
 		products,
@@ -164,7 +332,11 @@ async function fetchBilling(token: string, signal?: AbortSignal): Promise<UsageS
 	};
 }
 
-function formatFooter(theme: ExtensionContext["ui"]["theme"], snap: UsageSnapshot | null, error?: string): string {
+function formatFooter(
+	theme: ExtensionContext["ui"]["theme"],
+	snap: UsageSnapshot | null,
+	error?: string,
+): string {
 	const label = theme.fg("muted", "Grok:");
 	if (error && !snap) {
 		return label + theme.fg("warning", "auth?");
@@ -173,13 +345,11 @@ function formatFooter(theme: ExtensionContext["ui"]["theme"], snap: UsageSnapsho
 		return label + theme.fg("accent", "…");
 	}
 
-	// Always one decimal place (e.g. 11.0%, 3.5%).
-	const pct = (Math.round(snap.percent * 10) / 10).toFixed(1);
+	const pct = formatPercent(snap.percent);
 	const pctNum = Number(pct);
 	const hot = pctNum >= 80;
 	const critical = pctNum >= 95;
 	const color = critical ? "error" : hot ? "warning" : "accent";
-	// Footer: Grok:11.0% Thu 09:34  (no wk/mo label)
 	const parts = [`${pct}%`];
 	if (snap.resetLabel) parts.push(snap.resetLabel);
 	return label + theme.fg(color as "accent" | "warning" | "error", parts.join(" "));
@@ -190,6 +360,7 @@ class GrokUsageCache {
 	private lastError: string | null = null;
 	private lastFetchTime = 0;
 	private inflight: Promise<void> | null = null;
+	private generation = 0;
 
 	setStatus(ctx: ExtensionContext, forceError?: string): void {
 		const status = formatFooter(ctx.ui.theme, this.last, forceError ?? this.lastError ?? undefined);
@@ -218,40 +389,51 @@ class GrokUsageCache {
 			return this.last;
 		}
 
+		const gen = ++this.generation;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
 		const run = (async () => {
-			const auth = readGrokAuth();
-			if (!auth) {
-				this.lastError = "no ~/.grok/auth.json token";
-				this.setStatus(ctx, this.lastError);
-				return;
-			}
-
-			// Soft-warn if token looks expired; still try (refresh may have updated key elsewhere).
-			if (auth.expiresAt) {
-				const exp = Date.parse(auth.expiresAt);
-				if (Number.isFinite(exp) && exp <= Date.now()) {
-					// Keep going; API may still accept or return 401.
-				}
-			}
-
 			try {
-				const snap = await fetchBilling(auth.token);
-				snap.email = auth.email;
-				this.last = snap;
-				this.lastError = null;
-				this.lastFetchTime = Date.now();
-				this.setStatus(ctx);
+				let auth = await resolveAuth(controller.signal);
+				try {
+					const snap = await fetchBilling(auth.token, controller.signal);
+					if (gen !== this.generation) return; // superseded by a newer force refresh
+					snap.email = auth.email;
+					this.last = snap;
+					this.lastError = null;
+					this.lastFetchTime = Date.now();
+					this.setStatus(ctx);
+					return;
+				} catch (err) {
+					// One retry after forced refresh on auth failure.
+					const msg = err instanceof Error ? err.message : "";
+					if (msg.startsWith("auth ") && auth.refreshToken) {
+						auth = await refreshAccessToken(auth, controller.signal);
+						const snap = await fetchBilling(auth.token, controller.signal);
+						if (gen !== this.generation) return;
+						snap.email = auth.email;
+						this.last = snap;
+						this.lastError = null;
+						this.lastFetchTime = Date.now();
+						this.setStatus(ctx);
+						return;
+					}
+					throw err;
+				}
 			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				this.lastError = msg;
+				if (gen !== this.generation) return;
+				this.lastError = sanitizeError(err);
 				this.lastFetchTime = Date.now();
 				// Keep stale data if we have it.
-				this.setStatus(ctx, this.last ? undefined : msg);
+				this.setStatus(ctx, this.last ? undefined : this.lastError);
+			} finally {
+				clearTimeout(timeout);
 			}
 		})();
 
 		this.inflight = run.finally(() => {
-			this.inflight = null;
+			if (this.inflight === run) this.inflight = null;
 		});
 		await this.inflight;
 		return this.last;
@@ -264,20 +446,19 @@ class GrokUsageCache {
 		if (!this.last) return "Grok usage: not fetched yet.";
 
 		const s = this.last;
-		const pct = (Math.round(s.percent * 10) / 10).toFixed(1);
+		const pct = formatPercent(s.percent);
 		const lines = [
 			`Grok usage: ${pct}%` + (s.periodLabel ? ` (${s.periodLabel})` : ""),
 		];
 		if (s.endIso) {
-			const end = new Date(s.endIso);
-			lines.push(`Period ends: ${end.toISOString()} (local ${s.resetLabel || "—"})`);
+			lines.push(`Period ends: ${new Date(s.endIso).toISOString()} (local ${s.resetLabel || "—"})`);
 		}
 		if (s.email) lines.push(`Account: ${s.email}`);
 		if (s.products.length) {
 			lines.push("Products:");
 			for (const p of s.products) {
-				const pct = p.usagePercent == null ? "—" : `${p.usagePercent}%`;
-				lines.push(`  - ${p.product}: ${pct}`);
+				const pPct = p.usagePercent == null ? "—" : `${formatPercent(Number(p.usagePercent))}%`;
+				lines.push(`  - ${p.product}: ${pPct}`);
 			}
 		}
 		if (s.onDemandCap > 0 || s.onDemandUsed > 0) {

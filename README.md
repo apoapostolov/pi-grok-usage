@@ -39,7 +39,7 @@ grok login
 grok models
 ```
 
-Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). No API key paste into Pi settings required.
+Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). If the access token is expired, the extension refreshes it via xAI OIDC and writes the new tokens back. No API key paste into Pi settings required.
 
 ## What you get
 
@@ -95,7 +95,7 @@ This is **account billing**, not:
 
 ### Footer shows `Grok:auth?`
 
-Token missing or rejected.
+Token missing, refresh failed, or still rejected after refresh.
 
 ```bash
 grok login

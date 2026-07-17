@@ -15,8 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local reset label as 3-char weekday + hour:minute (e.g. `Thu 23:34`)
 - Color thresholds: warning at 80%, error at 95%
 - Auth via existing `~/.grok/auth.json` (from `grok login`)
+- OIDC token refresh when access token is expired/near expiry, with write-back to `auth.json`
+- Automatic one-shot retry after refresh on billing `401/403`
+- 10s request timeout on network calls
+- Sanitized error messages (no raw upstream response bodies)
 - Billing fetch from `cli-chat-proxy.grok.com` (same source as Grok TUI `/usage`)
 - 120s cache + in-flight request coalescing
+- Force refresh generation guard (stale responses ignored)
 - Auto-refresh on session start and turn end
 - `/grok-usage` command for forced refresh + detailed breakdown
 - `/grok-usage clear` to hide the footer
