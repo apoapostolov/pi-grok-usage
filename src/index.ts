@@ -69,17 +69,26 @@ interface UsageSnapshot {
 
 function periodShort(type?: string): string {
 	if (!type) return "";
-	if (type.includes("WEEKLY")) return "wk";
-	if (type.includes("MONTHLY")) return "mo";
-	if (type.includes("DAILY")) return "day";
+	if (type.includes("WEEKLY")) return "weekly";
+	if (type.includes("MONTHLY")) return "monthly";
+	if (type.includes("DAILY")) return "daily";
 	return "period";
 }
 
-function resetShort(endIso?: string): string {
+/** Footer reset label: 3-char weekday + local hour:minute, e.g. "Thu 09:34". */
+function resetLocalLabel(endIso?: string): string {
 	if (!endIso) return "";
 	const end = new Date(endIso);
 	if (Number.isNaN(end.getTime())) return "";
-	return end.toLocaleDateString("en-US", { weekday: "short" });
+	const weekday = end.toLocaleDateString(undefined, { weekday: "short" }); // e.g. Thu
+	const hour = end.toLocaleTimeString(undefined, {
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+	// Some locales still emit "24:xx" or include extra spaces; normalize.
+	const hhmm = hour.replace(/^24:/, "00:").trim();
+	return `${weekday} ${hhmm}`;
 }
 
 function readGrokAuth(): { token: string; email?: string; expiresAt?: string } | null {
@@ -145,7 +154,7 @@ async function fetchBilling(token: string, signal?: AbortSignal): Promise<UsageS
 	return {
 		percent: Number.isFinite(percent) ? percent : 0,
 		periodLabel,
-		resetLabel: resetShort(endIso),
+		resetLabel: resetLocalLabel(endIso),
 		endIso,
 		products,
 		onDemandUsed: Number(cfg.onDemandUsed?.val ?? 0),
@@ -164,12 +173,14 @@ function formatFooter(theme: ExtensionContext["ui"]["theme"], snap: UsageSnapsho
 		return label + theme.fg("accent", "…");
 	}
 
-	const pct = Math.round(snap.percent * 10) / 10;
-	const hot = pct >= 80;
-	const critical = pct >= 95;
+	// Always one decimal place (e.g. 11.0%, 3.5%).
+	const pct = (Math.round(snap.percent * 10) / 10).toFixed(1);
+	const pctNum = Number(pct);
+	const hot = pctNum >= 80;
+	const critical = pctNum >= 95;
 	const color = critical ? "error" : hot ? "warning" : "accent";
+	// Footer: Grok:11.0% Thu 09:34  (no wk/mo label)
 	const parts = [`${pct}%`];
-	if (snap.periodLabel) parts.push(snap.periodLabel);
 	if (snap.resetLabel) parts.push(snap.resetLabel);
 	return label + theme.fg(color as "accent" | "warning" | "error", parts.join(" "));
 }
@@ -253,13 +264,13 @@ class GrokUsageCache {
 		if (!this.last) return "Grok usage: not fetched yet.";
 
 		const s = this.last;
+		const pct = (Math.round(s.percent * 10) / 10).toFixed(1);
 		const lines = [
-			`Grok usage: ${Math.round(s.percent * 10) / 10}%` +
-				(s.periodLabel ? ` (${s.periodLabel})` : ""),
+			`Grok usage: ${pct}%` + (s.periodLabel ? ` (${s.periodLabel})` : ""),
 		];
 		if (s.endIso) {
 			const end = new Date(s.endIso);
-			lines.push(`Period ends: ${end.toISOString()} (${s.resetLabel || "—"})`);
+			lines.push(`Period ends: ${end.toISOString()} (local ${s.resetLabel || "—"})`);
 		}
 		if (s.email) lines.push(`Account: ${s.email}`);
 		if (s.products.length) {
