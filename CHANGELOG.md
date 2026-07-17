@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 10s request timeout on network calls
 - Sanitized error messages (no raw upstream response bodies)
 - Billing fetch from `cli-chat-proxy.grok.com` (same source as Grok TUI `/usage`)
-- 120s cache + in-flight request coalescing
+- 5-minute periodic refresh + cooldown (also on session start / turn end)
+- In-flight request coalescing
 - Force refresh generation guard (stale responses ignored)
 - Auto-refresh on session start and turn end
 - `/grok-usage` command for forced refresh + detailed breakdown

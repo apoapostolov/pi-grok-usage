@@ -18,7 +18,8 @@ import { join } from "node:path";
 
 const STATUS_ID = "grok-usage";
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-const FETCH_COOLDOWN_MS = 120_000;
+/** Minimum time between fetches (also the periodic refresh cadence). */
+const FETCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Refresh a bit before expiry to avoid edge races. */
 const EXPIRY_SKEW_MS = 60_000;
@@ -476,23 +477,55 @@ class GrokUsageCache {
 
 export default function (pi: ExtensionAPI) {
 	const cache = new GrokUsageCache();
+	let lastCtx: ExtensionContext | null = null;
+	let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+	const remember = (ctx: ExtensionContext) => {
+		lastCtx = ctx;
+	};
+
+	const startPeriodicRefresh = () => {
+		if (refreshTimer) return;
+		refreshTimer = setInterval(() => {
+			if (!lastCtx) return;
+			// Cooldown still applies; this just ensures idle sessions update every 5 min.
+			cache.update(lastCtx).catch(() => {});
+		}, FETCH_COOLDOWN_MS);
+		// Don't keep the process alive solely for this timer if Pi exits.
+		if (typeof refreshTimer === "object" && refreshTimer && "unref" in refreshTimer) {
+			(refreshTimer as NodeJS.Timeout).unref?.();
+		}
+	};
+
+	const stopPeriodicRefresh = () => {
+		if (refreshTimer) {
+			clearInterval(refreshTimer);
+			refreshTimer = null;
+		}
+		lastCtx = null;
+	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		remember(ctx);
+		startPeriodicRefresh();
 		// Fire-and-forget: never block session startup.
 		cache.update(ctx).catch(() => {});
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
+		remember(ctx);
 		cache.update(ctx).catch(() => {});
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		stopPeriodicRefresh();
 		cache.clear(ctx);
 	});
 
 	pi.registerCommand("grok-usage", {
 		description: "Show/refresh Grok account credit usage in the footer",
 		handler: async (args, ctx) => {
+			remember(ctx);
 			const cmd = (args ?? "").trim().toLowerCase();
 			if (cmd === "clear" || cmd === "hide" || cmd === "off") {
 				cache.clear(ctx);

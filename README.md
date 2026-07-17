@@ -47,7 +47,7 @@ Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). If th
 |--------|----------|
 | Footer | `Grok:<pct.1>% <Wed> <HH:mm>` local reset time |
 | Colors | normal → warning ≥80% → error ≥95% |
-| Refresh | session start + turn end (120s cache) |
+| Refresh | every 5 minutes (also on session start / turn end, throttled) |
 | `/grok-usage` | force refresh + product breakdown |
 | `/grok-usage clear` | hide footer |
 
