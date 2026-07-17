@@ -104,7 +104,8 @@ function resetLocalLabel(endIso?: string): string {
 }
 
 function formatPercent(n: number): string {
-	return (Math.round(n * 10) / 10).toFixed(1);
+	// Grok billing reports whole-number percents; keep display as integer.
+	return String(Math.round(Number.isFinite(n) ? n : 0));
 }
 
 /** Never surface raw upstream bodies (may contain tokens or HTML dumps). */

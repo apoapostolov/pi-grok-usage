@@ -5,7 +5,7 @@ Show **Grok / xAI account credit usage** in the [Pi](https://pi.dev) status bar.
 Uses the same billing source as Grok Build's in-TUI `/usage` command — not session token counters, not Claude subscription windows. Real account credit %.
 
 ```
-Grok:11.0% Thu 09:34
+Grok:11% Thu 09:34
 ```
 
 ## Why
@@ -45,18 +45,18 @@ Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). If th
 
 | Surface | Behavior |
 |--------|----------|
-| Footer | `Grok:<pct.1>% <Wed> <HH:mm>` local reset time |
+| Footer | `Grok:<pct>% <Wed> <HH:mm>` local reset time |
 | Colors | normal → warning ≥80% → error ≥95% |
 | Refresh | every 5 minutes (also on session start / turn end, throttled) |
 | `/grok-usage` | force refresh + product breakdown |
 | `/grok-usage clear` | hide footer |
 
-Footer example: `Grok:11.0% Thu 09:34` — one decimal percent, 3-char weekday, local hour:minute of period end. No `wk`/`mo` clutter.
+Footer example: `Grok:11% Thu 09:34` — whole-number percent, 3-char weekday, local hour:minute of period end. No `wk`/`mo` clutter.
 
 Example detail output:
 
 ```text
-Grok usage: 11.0% (weekly)
+Grok usage: 11% (weekly)
 Period ends: 2026-07-24T06:34:33.775Z (local Thu 09:34)
 Account: you@example.com
 Products:
@@ -75,7 +75,7 @@ GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
 Authorization: Bearer <token>
         │
         ▼
-Pi footer status: "Grok:11.0% Thu 09:34"
+Pi footer status: "Grok:11% Thu 09:34"
 ```
 
 This is **account billing**, not:
