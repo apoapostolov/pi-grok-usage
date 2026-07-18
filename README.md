@@ -23,7 +23,7 @@ pi install git:github.com/apoapostolov/pi-grok-usage
 Or pin a tag:
 
 ```bash
-pi install git:github.com/apoapostolov/pi-grok-usage@v1.0.1
+pi install git:github.com/apoapostolov/pi-grok-usage@v1.0.2
 ```
 
 Reload Pi (`/reload` or new session).
@@ -45,8 +45,8 @@ Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). If th
 
 | Surface | Behavior |
 |--------|----------|
-| Footer | `Grok:<pct>% <Wed> <HH:mm>` local reset time (`setStatus`) |
-| Powerbar | `Grok <reset>` + `%` bar when [pi-powerbar](https://github.com/juanibiapina/pi-powerbar) is installed |
+| Footer | `Grok:<pct>% <Wed> <HH:mm>` via `setStatus` (when powerbar segment is off/unavailable) |
+| Powerbar | `Grok <reset>` + `%` bar when [pi-powerbar](https://github.com/juanibiapina/pi-powerbar) is installed **and** `grok-usage` is enabled — exclusive, no footer duplicate |
 | Colors | normal → warning ≥80% → error ≥95% |
 | Refresh | every ~5 min idle; also on session start, agent start (prompt), turn end (throttled) |
 | `/grok-usage` | force refresh + product breakdown |

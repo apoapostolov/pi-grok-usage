@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+### Fixed
+- Stop dual-writing Grok into both powerbar and the built-in footer
+- When pi-powerbar is installed and the `grok-usage` segment is enabled → powerbar only
+- Otherwise → footer `setStatus` only
+
 ## 1.0.1
 
 ### Fixed
