@@ -92,7 +92,14 @@ interface UsageSnapshot {
 	fetchedAt: number;
 }
 
-type PublishFn = (status: string | undefined, snap: UsageSnapshot | null, error?: string) => void;
+type DisplayMode = "footer" | "powerbar";
+
+type PublishFn = (
+	mode: DisplayMode,
+	status: string | undefined,
+	snap: UsageSnapshot | null,
+	error?: string,
+) => void;
 
 function periodShort(type?: string): string {
 	if (!type) return "";
@@ -402,12 +409,24 @@ class GrokUsageCache {
 		this.publish = publish;
 	}
 
+	private displayMode: DisplayMode = "footer";
+
+	setDisplayMode(mode: DisplayMode): void {
+		this.displayMode = mode;
+	}
+
 	private emit(ctx: ExtensionContext, forceError?: string): void {
 		const error = forceError ?? this.lastError ?? undefined;
 		const status = formatFooter(ctx.ui.theme, this.last, error);
-		// Always attempt setStatus (built-in footer). Powerbar publish is separate.
+		// Exclusive: never dual-write footer setStatus + powerbar segment.
+		if (this.displayMode === "powerbar") {
+			ctx.ui.setStatus(STATUS_ID, undefined);
+			this.publish("powerbar", status, this.last, error);
+			return;
+		}
+		// Footer mode: clear powerbar segment so it can't linger after a mode switch.
+		this.publish("footer", status, this.last, error);
 		ctx.ui.setStatus(STATUS_ID, status);
-		this.publish(status, this.last, error);
 	}
 
 	setStatus(ctx: ExtensionContext, forceError?: string): void {
@@ -416,7 +435,7 @@ class GrokUsageCache {
 
 	clear(ctx: ExtensionContext): void {
 		ctx.ui.setStatus(STATUS_ID, undefined);
-		this.publish(undefined, null);
+		this.publish(this.displayMode, undefined, null);
 	}
 
 	/** True when a network fetch is allowed under cooldown rules. */
@@ -542,11 +561,69 @@ class GrokUsageCache {
 	}
 }
 
+function agentDir(): string {
+	return join(homedir(), ".pi", "agent");
+}
+
+function packageSource(entry: unknown): string {
+	if (typeof entry === "string") return entry;
+	if (entry && typeof entry === "object" && "source" in entry) {
+		return String((entry as { source?: unknown }).source ?? "");
+	}
+	return "";
+}
+
+/** True when pi-powerbar is listed in agent settings packages. */
+function isPowerbarInstalled(): boolean {
+	try {
+		const raw = JSON.parse(readFileSync(join(agentDir(), "settings.json"), "utf8")) as {
+			packages?: unknown[];
+		};
+		return (raw.packages ?? []).some((p) => packageSource(p).includes("pi-powerbar"));
+	} catch {
+		return false;
+	}
+}
+
+/** True when the grok-usage segment is on powerbar left/right. */
+function isPowerbarSegmentEnabled(): boolean {
+	const defaultLeft = "git-branch,tokens,context-usage";
+	const defaultRight = "provider,model,sub-hourly,sub-weekly";
+	try {
+		let left = defaultLeft;
+		let right = defaultRight;
+		const path = join(agentDir(), "settings-extensions.json");
+		if (existsSync(path)) {
+			const file = JSON.parse(readFileSync(path, "utf8")) as {
+				powerbar?: { left?: string; right?: string };
+			};
+			if (typeof file.powerbar?.left === "string") left = file.powerbar.left;
+			if (typeof file.powerbar?.right === "string") right = file.powerbar.right;
+		}
+		const ids = `${left},${right}`
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+		return ids.includes(POWERBAR_SEGMENT_ID);
+	} catch {
+		return false;
+	}
+}
+
+function resolveDisplayMode(): DisplayMode {
+	// Prefer powerbar only when the package is installed AND the segment is enabled.
+	// Otherwise footer setStatus only — never both (duplicate Grok lines).
+	if (isPowerbarInstalled() && isPowerbarSegmentEnabled()) return "powerbar";
+	return "footer";
+}
+
 export default function (pi: ExtensionAPI) {
 	const cache = new GrokUsageCache();
 	let lastCtx: ExtensionContext | null = null;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let powerbarRegistered = false;
+	const displayMode = resolveDisplayMode();
+	cache.setDisplayMode(displayMode);
 
 	const ensurePowerbarSegment = () => {
 		if (powerbarRegistered) return;
@@ -561,31 +638,45 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const publishToPowerbar: PublishFn = (_status, snap, error) => {
+	const clearPowerbarSegment = () => {
+		try {
+			pi.events.emit("powerbar:update", {
+				id: POWERBAR_SEGMENT_ID,
+				text: undefined,
+			});
+		} catch {
+			// ignore
+		}
+	};
+
+	const publishDisplay: PublishFn = (mode, status, snap, error) => {
+		// Footer-only mode: make sure powerbar segment is gone.
+		if (mode === "footer") {
+			clearPowerbarSegment();
+			return;
+		}
+
+		// Powerbar mode.
 		try {
 			ensurePowerbarSegment();
+			if (status === undefined && !snap && !error) {
+				clearPowerbarSegment();
+				return;
+			}
 			if (!snap && error) {
 				pi.events.emit("powerbar:update", {
 					id: POWERBAR_SEGMENT_ID,
-					text: "auth?",
+					text: "Grok auth?",
 					color: "warning",
 				});
 				return;
 			}
 			if (!snap) {
-				// Loading or cleared
-				if (_status === undefined) {
-					pi.events.emit("powerbar:update", {
-						id: POWERBAR_SEGMENT_ID,
-						text: undefined,
-					});
-				} else {
-					pi.events.emit("powerbar:update", {
-						id: POWERBAR_SEGMENT_ID,
-						text: "…",
-						color: "muted",
-					});
-				}
+				pi.events.emit("powerbar:update", {
+					id: POWERBAR_SEGMENT_ID,
+					text: "Grok …",
+					color: "muted",
+				});
 				return;
 			}
 
@@ -607,7 +698,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	cache.setPublisher(publishToPowerbar);
+	cache.setPublisher(publishDisplay);
 
 	const remember = (ctx: ExtensionContext) => {
 		lastCtx = ctx;
@@ -651,8 +742,8 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	// Register powerbar segment early so settings UI can list it.
-	ensurePowerbarSegment();
+	// Register powerbar segment early so settings UI can list it (even in footer mode).
+	if (isPowerbarInstalled()) ensurePowerbarSegment();
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Fire-and-forget: never block session startup.
@@ -676,14 +767,7 @@ export default function (pi: ExtensionAPI) {
 			cache.clear(ctx);
 		} catch {
 			// ctx may already be tearing down
-			try {
-				pi.events.emit("powerbar:update", {
-					id: POWERBAR_SEGMENT_ID,
-					text: undefined,
-				});
-			} catch {
-				// ignore
-			}
+			clearPowerbarSegment();
 		}
 	});
 
