@@ -23,7 +23,7 @@ pi install git:github.com/apoapostolov/pi-grok-usage
 Or pin a tag:
 
 ```bash
-pi install git:github.com/apoapostolov/pi-grok-usage@v1.0.0
+pi install git:github.com/apoapostolov/pi-grok-usage@v1.0.1
 ```
 
 Reload Pi (`/reload` or new session).
@@ -45,11 +45,12 @@ Auth is read from `~/.grok/auth.json` (OIDC access token from Grok Build). If th
 
 | Surface | Behavior |
 |--------|----------|
-| Footer | `Grok:<pct>% <Wed> <HH:mm>` local reset time |
+| Footer | `Grok:<pct>% <Wed> <HH:mm>` local reset time (`setStatus`) |
+| Powerbar | `Grok <reset>` + `%` bar when [pi-powerbar](https://github.com/juanibiapina/pi-powerbar) is installed |
 | Colors | normal → warning ≥80% → error ≥95% |
-| Refresh | every 5 minutes (also on session start / turn end, throttled) |
+| Refresh | every ~5 min idle; also on session start, agent start (prompt), turn end (throttled) |
 | `/grok-usage` | force refresh + product breakdown |
-| `/grok-usage clear` | hide footer |
+| `/grok-usage clear` | hide footer / powerbar segment |
 
 Footer example: `Grok:11% Thu 09:34` — whole-number percent, 3-char weekday, local hour:minute of period end. No `wk`/`mo` clutter.
 
@@ -112,6 +113,7 @@ First fetch still running or network blocked. Run `/grok-usage` for the error te
 1. Confirm package is listed: `pi list`
 2. Reload session: `/reload`
 3. Check extension path includes `src/index.ts` in package metadata
+4. If you use **pi-powerbar**, enable the `grok-usage` segment under right/left segments (`/extension-settings` → powerbar)
 
 ### Using Pi with DeepSeek / other models
 

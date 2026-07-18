@@ -1,6 +1,6 @@
 {
   "name": "pi-grok-usage",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi extension that shows Grok/xAI account credit usage in the status bar using your existing grok login.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,8 @@
     "status-bar",
     "footer",
     "cli",
-    "coding-agent"
+    "coding-agent",
+    "powerbar"
   ],
   "author": "Apostol Apostolov",
   "license": "MIT",

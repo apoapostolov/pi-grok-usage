@@ -2,14 +2,21 @@
  * Grok account usage footer for Pi.
  *
  * Polls Grok Build billing (same source as Grok TUI `/usage`) and shows
- * credit usage in the Pi status bar.
+ * credit usage in the Pi status bar (setStatus) and powerbar (if installed).
  *
  * Auth: ~/.grok/auth.json OIDC key (from `grok login`), with refresh support
  * API:  GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
  *
+ * Refresh:
+ *   - session_start: initial fetch + start 5-min timer
+ *   - agent_start:   prompt-time refresh when cooldown elapsed
+ *   - turn_end:      post-turn refresh when cooldown elapsed
+ *   - interval:      idle refresh (~every 5 min)
+ *   - /grok-usage:   force refresh + details
+ *
  * Commands:
  *   /grok-usage        force refresh + show details
- *   /grok-usage clear  hide footer
+ *   /grok-usage clear  hide footer / powerbar segment
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -17,9 +24,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const STATUS_ID = "grok-usage";
+const POWERBAR_SEGMENT_ID = "grok-usage";
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/** Minimum time between fetches (also the periodic refresh cadence). */
+/** Minimum time between successful fetches. */
 const FETCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+/** Retry sooner after a failed fetch (don't lock out for a full cooldown). */
+const ERROR_RETRY_MS = 30 * 1000; // 30 seconds
+/** Interval tick slightly under cooldown so timer edges don't no-op. */
+const PERIODIC_TICK_MS = FETCH_COOLDOWN_MS - 15_000; // 4m45s
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Refresh a bit before expiry to avoid edge races. */
 const EXPIRY_SKEW_MS = 60_000;
@@ -80,6 +92,8 @@ interface UsageSnapshot {
 	fetchedAt: number;
 }
 
+type PublishFn = (status: string | undefined, snap: UsageSnapshot | null, error?: string) => void;
+
 function periodShort(type?: string): string {
 	if (!type) return "";
 	if (type.includes("WEEKLY")) return "weekly";
@@ -108,6 +122,18 @@ function formatPercent(n: number): string {
 	return String(Math.round(Number.isFinite(n) ? n : 0));
 }
 
+function usageColor(pctNum: number): "accent" | "warning" | "error" {
+	if (pctNum >= 95) return "error";
+	if (pctNum >= 80) return "warning";
+	return "accent";
+}
+
+function powerbarColor(pctNum: number): string {
+	if (pctNum >= 95) return "error";
+	if (pctNum >= 80) return "warning";
+	return "muted";
+}
+
 /** Never surface raw upstream bodies (may contain tokens or HTML dumps). */
 function sanitizeError(err: unknown): string {
 	if (err instanceof Error) {
@@ -121,9 +147,15 @@ function sanitizeError(err: unknown): string {
 		}
 		if (msg.includes("refresh")) return "token refresh failed — run `grok login`";
 		if (msg.includes("auth.json")) return msg;
+		if (msg.includes("stale after session")) return "stale context";
 		return "request failed";
 	}
 	return "request failed";
+}
+
+function isStaleContextError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return msg.includes("stale after session") || msg.includes("extension ctx is stale");
 }
 
 function isAllowedXaiUrl(raw: string): boolean {
@@ -349,43 +381,71 @@ function formatFooter(
 
 	const pct = formatPercent(snap.percent);
 	const pctNum = Number(pct);
-	const hot = pctNum >= 80;
-	const critical = pctNum >= 95;
-	const color = critical ? "error" : hot ? "warning" : "accent";
+	const color = usageColor(pctNum);
 	const parts = [`${pct}%`];
 	if (snap.resetLabel) parts.push(snap.resetLabel);
-	return label + theme.fg(color as "accent" | "warning" | "error", parts.join(" "));
+	return label + theme.fg(color, parts.join(" "));
 }
 
 class GrokUsageCache {
 	private last: UsageSnapshot | null = null;
 	private lastError: string | null = null;
-	private lastFetchTime = 0;
+	/** Timestamp of last successful fetch (drives success cooldown). */
+	private lastSuccessTime = 0;
+	/** Timestamp of last failed fetch (drives short error backoff). */
+	private lastErrorTime = 0;
 	private inflight: Promise<void> | null = null;
 	private generation = 0;
+	private publish: PublishFn = () => {};
+
+	setPublisher(publish: PublishFn): void {
+		this.publish = publish;
+	}
+
+	private emit(ctx: ExtensionContext, forceError?: string): void {
+		const error = forceError ?? this.lastError ?? undefined;
+		const status = formatFooter(ctx.ui.theme, this.last, error);
+		// Always attempt setStatus (built-in footer). Powerbar publish is separate.
+		ctx.ui.setStatus(STATUS_ID, status);
+		this.publish(status, this.last, error);
+	}
 
 	setStatus(ctx: ExtensionContext, forceError?: string): void {
-		const status = formatFooter(ctx.ui.theme, this.last, forceError ?? this.lastError ?? undefined);
-		ctx.ui.setStatus(STATUS_ID, status);
+		this.emit(ctx, forceError);
 	}
 
 	clear(ctx: ExtensionContext): void {
 		ctx.ui.setStatus(STATUS_ID, undefined);
+		this.publish(undefined, null);
+	}
+
+	/** True when a network fetch is allowed under cooldown rules. */
+	private canFetch(force: boolean): boolean {
+		if (force) return true;
+		const now = Date.now();
+
+		// Successful fetch: full 5-min cooldown.
+		if (this.lastSuccessTime && now - this.lastSuccessTime < FETCH_COOLDOWN_MS) {
+			return false;
+		}
+
+		// Failed fetch (and no newer success): short backoff only.
+		if (this.lastErrorTime > this.lastSuccessTime && now - this.lastErrorTime < ERROR_RETRY_MS) {
+			return false;
+		}
+
+		return true;
 	}
 
 	async update(ctx: ExtensionContext, opts: { force?: boolean } = {}): Promise<UsageSnapshot | null> {
-		const now = Date.now();
-		if (
-			!opts.force &&
-			this.last &&
-			this.lastFetchTime &&
-			now - this.lastFetchTime < FETCH_COOLDOWN_MS
-		) {
+		const force = opts.force === true;
+
+		if (!this.canFetch(force)) {
 			this.setStatus(ctx);
 			return this.last;
 		}
 
-		if (this.inflight && !opts.force) {
+		if (this.inflight && !force) {
 			await this.inflight;
 			this.setStatus(ctx);
 			return this.last;
@@ -404,7 +464,8 @@ class GrokUsageCache {
 					snap.email = auth.email;
 					this.last = snap;
 					this.lastError = null;
-					this.lastFetchTime = Date.now();
+					this.lastSuccessTime = Date.now();
+					this.lastErrorTime = 0;
 					this.setStatus(ctx);
 					return;
 				} catch (err) {
@@ -417,7 +478,8 @@ class GrokUsageCache {
 						snap.email = auth.email;
 						this.last = snap;
 						this.lastError = null;
-						this.lastFetchTime = Date.now();
+						this.lastSuccessTime = Date.now();
+						this.lastErrorTime = 0;
 						this.setStatus(ctx);
 						return;
 					}
@@ -425,9 +487,13 @@ class GrokUsageCache {
 				}
 			} catch (err) {
 				if (gen !== this.generation) return;
+				if (isStaleContextError(err)) {
+					// Don't burn cooldown on stale ctx — caller should rebind.
+					throw err;
+				}
 				this.lastError = sanitizeError(err);
-				this.lastFetchTime = Date.now();
-				// Keep stale data if we have it.
+				this.lastErrorTime = Date.now();
+				// Keep stale data if we have it; do NOT advance success cooldown.
 				this.setStatus(ctx, this.last ? undefined : this.lastError);
 			} finally {
 				clearTimeout(timeout);
@@ -480,22 +546,71 @@ export default function (pi: ExtensionAPI) {
 	const cache = new GrokUsageCache();
 	let lastCtx: ExtensionContext | null = null;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
+	let powerbarRegistered = false;
+
+	const ensurePowerbarSegment = () => {
+		if (powerbarRegistered) return;
+		powerbarRegistered = true;
+		try {
+			pi.events.emit("powerbar:register-segment", {
+				id: POWERBAR_SEGMENT_ID,
+				label: "Grok Usage",
+			});
+		} catch {
+			// powerbar may not be installed — fine
+		}
+	};
+
+	const publishToPowerbar: PublishFn = (_status, snap, error) => {
+		try {
+			ensurePowerbarSegment();
+			if (!snap && error) {
+				pi.events.emit("powerbar:update", {
+					id: POWERBAR_SEGMENT_ID,
+					text: "auth?",
+					color: "warning",
+				});
+				return;
+			}
+			if (!snap) {
+				// Loading or cleared
+				if (_status === undefined) {
+					pi.events.emit("powerbar:update", {
+						id: POWERBAR_SEGMENT_ID,
+						text: undefined,
+					});
+				} else {
+					pi.events.emit("powerbar:update", {
+						id: POWERBAR_SEGMENT_ID,
+						text: "…",
+						color: "muted",
+					});
+				}
+				return;
+			}
+
+			const pctNum = Math.round(snap.percent);
+			const reset = snap.resetLabel || "";
+			const textParts = ["Grok"];
+			if (reset) textParts.push(reset);
+
+			pi.events.emit("powerbar:update", {
+				id: POWERBAR_SEGMENT_ID,
+				text: textParts.join(" "),
+				suffix: `${pctNum}%`,
+				bar: pctNum,
+				barSegments: 10,
+				color: powerbarColor(pctNum),
+			});
+		} catch {
+			// powerbar absent or event bus unavailable
+		}
+	};
+
+	cache.setPublisher(publishToPowerbar);
 
 	const remember = (ctx: ExtensionContext) => {
 		lastCtx = ctx;
-	};
-
-	const startPeriodicRefresh = () => {
-		if (refreshTimer) return;
-		refreshTimer = setInterval(() => {
-			if (!lastCtx) return;
-			// Cooldown still applies; this just ensures idle sessions update every 5 min.
-			cache.update(lastCtx).catch(() => {});
-		}, FETCH_COOLDOWN_MS);
-		// Don't keep the process alive solely for this timer if Pi exits.
-		if (typeof refreshTimer === "object" && refreshTimer && "unref" in refreshTimer) {
-			(refreshTimer as NodeJS.Timeout).unref?.();
-		}
 	};
 
 	const stopPeriodicRefresh = () => {
@@ -503,30 +618,80 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(refreshTimer);
 			refreshTimer = null;
 		}
-		lastCtx = null;
 	};
 
-	pi.on("session_start", async (_event, ctx) => {
+	const startPeriodicRefresh = () => {
+		if (refreshTimer) return;
+		refreshTimer = setInterval(() => {
+			const ctx = lastCtx;
+			if (!ctx) return;
+			// Cooldown still applies; tick is slightly under 5m so edges don't miss.
+			cache.update(ctx).catch((err) => {
+				if (isStaleContextError(err)) {
+					// Session was replaced — drop dead ctx and wait for a live event.
+					lastCtx = null;
+					return;
+				}
+				// Soft-fail: keep last known status; next tick/event retries.
+			});
+		}, PERIODIC_TICK_MS);
+		// Don't keep the process alive solely for this timer if Pi exits.
+		if (typeof refreshTimer === "object" && refreshTimer && "unref" in refreshTimer) {
+			(refreshTimer as NodeJS.Timeout).unref?.();
+		}
+	};
+
+	const kick = (ctx: ExtensionContext, opts?: { force?: boolean }) => {
 		remember(ctx);
 		startPeriodicRefresh();
+		cache.update(ctx, opts).catch((err) => {
+			if (isStaleContextError(err)) {
+				lastCtx = null;
+			}
+		});
+	};
+
+	// Register powerbar segment early so settings UI can list it.
+	ensurePowerbarSegment();
+
+	pi.on("session_start", async (_event, ctx) => {
 		// Fire-and-forget: never block session startup.
-		cache.update(ctx).catch(() => {});
+		kick(ctx);
 	});
 
+	// Prompt-time: refresh as soon as a new agent run starts if cooldown elapsed.
+	pi.on("agent_start", async (_event, ctx) => {
+		kick(ctx);
+	});
+
+	// Post-turn: catch usage that landed during the turn.
 	pi.on("turn_end", async (_event, ctx) => {
-		remember(ctx);
-		cache.update(ctx).catch(() => {});
+		kick(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		stopPeriodicRefresh();
-		cache.clear(ctx);
+		lastCtx = null;
+		try {
+			cache.clear(ctx);
+		} catch {
+			// ctx may already be tearing down
+			try {
+				pi.events.emit("powerbar:update", {
+					id: POWERBAR_SEGMENT_ID,
+					text: undefined,
+				});
+			} catch {
+				// ignore
+			}
+		}
 	});
 
 	pi.registerCommand("grok-usage", {
 		description: "Show/refresh Grok account credit usage in the footer",
 		handler: async (args, ctx) => {
 			remember(ctx);
+			startPeriodicRefresh();
 			const cmd = (args ?? "").trim().toLowerCase();
 			if (cmd === "clear" || cmd === "hide" || cmd === "off") {
 				cache.clear(ctx);
