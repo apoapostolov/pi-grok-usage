@@ -8,10 +8,10 @@
  * API:  GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
  *
  * Refresh:
- *   - session_start: initial fetch + start 5-min timer
+ *   - session_start: initial fetch + start 10-min timer
  *   - agent_start:   prompt-time refresh when cooldown elapsed
  *   - turn_end:      post-turn refresh when cooldown elapsed
- *   - interval:      idle refresh (~every 5 min)
+ *   - interval:      idle refresh (~every 10 min)
  *   - /grok-usage:   force refresh + details
  *
  * Commands:
@@ -27,18 +27,18 @@ const STATUS_ID = "grok-usage";
 const POWERBAR_SEGMENT_ID = "grok-usage";
 const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 /** Minimum time between successful fetches. */
-const FETCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const FETCH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 /** Retry sooner after a failed fetch (don't lock out for a full cooldown). */
 const ERROR_RETRY_MS = 30 * 1000; // 30 seconds
 /**
  * Idle poll cadence. Must be >= FETCH_COOLDOWN_MS.
  *
- * Prior bug: this was cooldown - 15s (4m45s). After a success at T=0 the first
- * tick always hit the 5m cooldown and no-op'd, so the next real fetch only
- * landed at T=9m30s. Effective idle refresh was ~9.5 min, not 5.
- * Keep a small positive skew so timer jitter can't land inside the cooldown.
+ * Prior bug: tick was cooldown - 15s. That always landed inside the success
+ * cooldown, so every other tick no-op'd and real idle fetches ran at ~2x the
+ * intended period. Keep a small positive skew so timer jitter can't land
+ * inside the cooldown.
  */
-const PERIODIC_TICK_MS = FETCH_COOLDOWN_MS + 5_000; // 5m5s
+const PERIODIC_TICK_MS = FETCH_COOLDOWN_MS + 5_000; // 10m5s
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Refresh a bit before expiry to avoid edge races. */
 const EXPIRY_SKEW_MS = 60_000;
@@ -462,7 +462,7 @@ class GrokUsageCache {
 		if (force) return true;
 		const now = Date.now();
 
-		// Successful fetch: full 5-min cooldown.
+		// Successful fetch: full cooldown window.
 		if (this.lastSuccessTime && now - this.lastSuccessTime < FETCH_COOLDOWN_MS) {
 			return false;
 		}
