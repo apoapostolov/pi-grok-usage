@@ -3,10 +3,10 @@
 ## 1.0.1
 
 ### Fixed
-- Refresh actually runs on schedule: interval tick is 4m45s so it no longer no-ops against the 5-min cooldown edge
+- Idle refresh actually hits ~5 min: interval is cooldown + 5s (5m5s), not cooldown − 15s (4m45s). The old "slightly under" tick always landed inside the 5-min success cooldown, so every other tick no-op'd and real idle fetches only ran every ~9.5 min
 - Prompt-time refresh on `agent_start` (not only after `turn_end`)
 - Failed fetches use a 30s retry instead of locking out for a full 5 minutes
-- Stale session context on the idle timer no longer kills refresh silently forever
+- Stale session context no longer kills idle refresh forever: powerbar paint does not require a live footer ctx, and the timer keeps polling when `lastCtx` is missing until a live event rebinds it
 - Stop dual-writing Grok into both powerbar and the built-in footer
 - When pi-powerbar is installed and the `grok-usage` segment is enabled → powerbar only
 - Otherwise → footer `setStatus` only

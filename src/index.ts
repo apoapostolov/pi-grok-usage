@@ -30,8 +30,15 @@ const BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const FETCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 /** Retry sooner after a failed fetch (don't lock out for a full cooldown). */
 const ERROR_RETRY_MS = 30 * 1000; // 30 seconds
-/** Interval tick slightly under cooldown so timer edges don't no-op. */
-const PERIODIC_TICK_MS = FETCH_COOLDOWN_MS - 15_000; // 4m45s
+/**
+ * Idle poll cadence. Must be >= FETCH_COOLDOWN_MS.
+ *
+ * Prior bug: this was cooldown - 15s (4m45s). After a success at T=0 the first
+ * tick always hit the 5m cooldown and no-op'd, so the next real fetch only
+ * landed at T=9m30s. Effective idle refresh was ~9.5 min, not 5.
+ * Keep a small positive skew so timer jitter can't land inside the cooldown.
+ */
+const PERIODIC_TICK_MS = FETCH_COOLDOWN_MS + 5_000; // 5m5s
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Refresh a bit before expiry to avoid edge races. */
 const EXPIRY_SKEW_MS = 60_000;
@@ -415,21 +422,33 @@ class GrokUsageCache {
 		this.displayMode = mode;
 	}
 
-	private emit(ctx: ExtensionContext, forceError?: string): void {
+	private emit(ctx: ExtensionContext | null, forceError?: string): void {
 		const error = forceError ?? this.lastError ?? undefined;
-		const status = formatFooter(ctx.ui.theme, this.last, error);
 		// Exclusive: never dual-write footer setStatus + powerbar segment.
 		if (this.displayMode === "powerbar") {
-			ctx.ui.setStatus(STATUS_ID, undefined);
-			this.publish("powerbar", status, this.last, error);
+			// Powerbar path only needs the event bus — don't hard-require a live ctx.
+			// A stale session ctx after reload/switch used to throw here and kill the
+			// idle timer (lastCtx nulled, every subsequent tick no-op'd forever).
+			// publishDisplay ignores the footer status string and paints from snap.
+			try {
+				ctx?.ui.setStatus(STATUS_ID, undefined);
+			} catch (err) {
+				if (!isStaleContextError(err)) throw err;
+			}
+			this.publish("powerbar", undefined, this.last, error);
 			return;
 		}
+		if (!ctx) {
+			// Footer mode has nothing to paint without a live ctx.
+			return;
+		}
+		const status = formatFooter(ctx.ui.theme, this.last, error);
 		// Footer mode: clear powerbar segment so it can't linger after a mode switch.
 		this.publish("footer", status, this.last, error);
 		ctx.ui.setStatus(STATUS_ID, status);
 	}
 
-	setStatus(ctx: ExtensionContext, forceError?: string): void {
+	setStatus(ctx: ExtensionContext | null, forceError?: string): void {
 		this.emit(ctx, forceError);
 	}
 
@@ -456,7 +475,7 @@ class GrokUsageCache {
 		return true;
 	}
 
-	async update(ctx: ExtensionContext, opts: { force?: boolean } = {}): Promise<UsageSnapshot | null> {
+	async update(ctx: ExtensionContext | null, opts: { force?: boolean } = {}): Promise<UsageSnapshot | null> {
 		const force = opts.force === true;
 
 		if (!this.canFetch(force)) {
@@ -715,11 +734,12 @@ export default function (pi: ExtensionAPI) {
 		if (refreshTimer) return;
 		refreshTimer = setInterval(() => {
 			const ctx = lastCtx;
-			if (!ctx) return;
-			// Cooldown still applies; tick is slightly under 5m so edges don't miss.
+			// Still poll when ctx is missing/stale: powerbar publish doesn't need it,
+			// and footer mode no-ops paint until a live event rebinds lastCtx.
 			cache.update(ctx).catch((err) => {
 				if (isStaleContextError(err)) {
-					// Session was replaced — drop dead ctx and wait for a live event.
+					// Session was replaced — drop dead ctx; keep timer alive for powerbar
+					// fetches and wait for session_start/agent_start/turn_end to rebind.
 					lastCtx = null;
 					return;
 				}
